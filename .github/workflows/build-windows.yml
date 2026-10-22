@@ -1,0 +1,38 @@
+
+name: Test and build Predictive Buffer V5 (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure tests
+        run: cmake -S . -B build-tests -DBUILD_TESTING=ON -DPB_BUILD_GEODE=OFF
+      - name: Build tests
+        run: cmake --build build-tests
+      - name: Run tests
+        run: ctest --test-dir build-tests --output-on-failure
+
+  geode-win64:
+    needs: portable-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          target: Win64
+          configure-args: -DPB_BUILD_GEODE=ON -DBUILD_TESTING=OFF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PredictiveBuffer-V5-Win64
+          path: ${{ steps.build.outputs.build-output }}/*.geode
+          if-no-files-found: error
+   
