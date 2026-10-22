@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <pb/Engine.hpp>
+#include "DebugConsole.hpp"
 
 using namespace geode::prelude;
 
@@ -27,6 +28,7 @@ class TrajectoryOracle final {
     bool active_ = false;
     bool dead_ = false;
     bool uncertain_ = false;
+    const char* uncertainReason_ = "none";
     float simulationStep_ = 1.f / 240.f;
     bool stepValid_ = true;
 
@@ -69,18 +71,26 @@ class TrajectoryOracle final {
 
 public:
     bool isActive() const { return active_; }
-    void markUncertain() { if (active_) uncertain_ = true; }
+    void markUncertain(const char* reason = "unsupported-effect") {
+        if (active_ && !uncertain_) {
+            uncertain_ = true;
+            uncertainReason_ = reason;
+        }
+    }
+    const char* lastUncertainty() const { return uncertainReason_; }
+    bool ready() const { return ghosts_[0] && ghosts_[1]; }
     bool onDeath(PlayerObject* who) {
         if (!active_) return false;
         if (who != ghosts_[0] && who != ghosts_[1]) return false;
         dead_ = true;
         return true;
     }
-    void frameStep(float delta) {
+    bool frameStep(float delta) {
         // Large/non-finite dt is not safe for speculative physics. Do not
         // reuse a stale prior frame as if the forecast were trustworthy.
         stepValid_ = std::isfinite(delta) && delta >= 0.0005f && delta <= 0.05f;
         if (stepValid_) simulationStep_ = delta;
+        return stepValid_;
     }
     void initialize(PlayLayer* layer) {
         shutdown();
@@ -97,6 +107,7 @@ public:
         }
         dead_ = false;
         uncertain_ = false;
+        uncertainReason_ = "none";
         stepValid_ = true;
         simulationStep_ = 1.f / 240.f;
     }
@@ -117,6 +128,7 @@ public:
             explicit SimScope(TrajectoryOracle& obj) : self(obj) {
                 self.dead_ = false;
                 self.uncertain_ = false;
+                self.uncertainReason_ = "none";
                 self.active_ = true;
             }
             ~SimScope() { self.active_ = false; }
@@ -156,6 +168,18 @@ struct Context {
     std::uint64_t tick = 0;
     bool injecting = false;
     bool lastF6 = false;
+    bool lastF7 = false;
+    bool lastF8 = false;
+    bool lastF9 = false;
+    bool lastF10 = false;
+    bool rawInputMode = false;
+    bool wasInvalidDelta = false;
+    std::uint64_t inputEdges = 0;
+    std::uint64_t deliveredEdges = 0;
+    std::uint64_t predictions = 0;
+    std::uint64_t delayed = 0;
+    std::uint64_t uncertain = 0;
+    std::uint64_t totalProbes = 0;
     bool wasShipMode = false;
     int preset = 0;
     int normalTicks = 2;
@@ -168,18 +192,45 @@ struct Context {
         inputs.reset();
         tick = 0;
         wasShipMode = false;
-        lastF6 = false;
+        lastF6 = lastF7 = lastF8 = lastF9 = lastF10 = false;
+        rawInputMode = false;
+        wasInvalidDelta = false;
+        inputEdges = deliveredEdges = predictions = delayed = uncertain = totalProbes = 0;
+        pb::diagnostic::console().write("LIFECYCLE", "PlayLayer initialized; creating trajectory ghosts");
         waveStreak[0] = waveStreak[1] = 0;
         prevEdge[0] = prevEdge[1] = 0;
         oracle.initialize(layer);
+        if (!oracle.ready()) {
+            pb::diagnostic::console().write("WARN", "Trajectory ghosts could not initialize; predictions will fail closed");
+        } else {
+            pb::diagnostic::console().write("LIFECYCLE", "Trajectory ghosts initialized");
+        }
     }
     void shutdown() {
+        printStats("EXIT");
+        pb::diagnostic::console().write("LIFECYCLE", "PlayLayer quitting / changing scene");
         inputs.reset();
         oracle.shutdown();
+    }
+    void printStats(const char* label) {
+        pb::diagnostic::console().writef(label,
+            "tick=%llu input=%llu delivered=%llu predictions=%llu delayed=%llu uncertain=%llu probes=%llu P1queue=%zu P2queue=%zu preset=%d enabled=%d",
+            static_cast<unsigned long long>(tick),
+            static_cast<unsigned long long>(inputEdges),
+            static_cast<unsigned long long>(deliveredEdges),
+            static_cast<unsigned long long>(predictions),
+            static_cast<unsigned long long>(delayed),
+            static_cast<unsigned long long>(uncertain),
+            static_cast<unsigned long long>(totalProbes),
+            inputs.pending(0), inputs.pending(1), preset + 1, enabled && !rawInputMode ? 1 : 0);
     }
     void emit(int lane, bool down) {
         auto* layer = PlayLayer::get();
         if (!layer) return;
+        ++deliveredEdges;
+        if (pb::diagnostic::console().trace())
+            pb::diagnostic::console().writef("EMIT", "tick=%llu P%d %s remaining=%zu", 
+                static_cast<unsigned long long>(tick), lane + 1, down ? "PRESS" : "RELEASE", inputs.pending(lane));
         struct Guard { bool& flag; explicit Guard(bool& f): flag(f) { flag = true; } ~Guard() {flag = false;} } guard(injecting);
         layer->handleButton(down, 1, lane == 0);
         const bool mirror = lane == 0 && layer->m_gameState.m_isDualMode &&
@@ -194,6 +245,8 @@ struct Context {
         waveTicks = wave[preset];
         enabled = preset != 4;
         inputs.reconcile([this](int player, bool down) { emit(player, down); });
+        pb::diagnostic::console().writef("STAGE", "F6 -> STAGE %d; normal=%d ticks wave=%d ticks %s",
+            preset + 1, normalTicks, waveTicks, enabled ? "ACTIVE" : "RAW INPUT");
         geode::log::info("PB5 stage {} normal={} wave={}", preset + 1, normalTicks, waveTicks);
     }
     void frame(PlayerObject* player, float dt) {
@@ -201,29 +254,60 @@ struct Context {
         if (!level || player != level->m_player1 || oracle.isActive()) return;
         // GD's player dt is normalized to 240 TPS; timewarp modifies its scale.
         const float warp = level->m_gameState.m_timeWarp;
-        oracle.frameStep(warp > 0.001f ? dt / warp : dt);
+        const float simDt = warp > 0.001f ? dt / warp : dt;
+        const bool validDelta = oracle.frameStep(simDt);
+        if (!validDelta && !wasInvalidDelta)
+            pb::diagnostic::console().writef("WARN", "Invalid prediction delta dt=%f warp=%f; passing inputs through", dt, warp);
+        if (validDelta && wasInvalidDelta)
+            pb::diagnostic::console().write("RECOVERY", "Prediction delta valid again");
+        wasInvalidDelta = !validDelta;
         ++tick;
         // No delayed wave/cube edge should spill into ship/dual-ship gameplay.
         const bool shipMode = (level->m_player1 && level->m_player1->m_isShip) ||
             (level->m_gameState.m_isDualMode && level->m_player2 && level->m_player2->m_isShip);
-        if (shipMode && !wasShipMode)
+        if (shipMode && !wasShipMode) {
+            pb::diagnostic::console().write("MODE", "Ship portal detected; flushing pending inputs");
             inputs.reconcile([this](int p, bool down) { emit(p, down); });
+        }
         wasShipMode = shipMode;
         const bool nowF6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         if (nowF6 && !lastF6) setPreset((preset + 1) % 5);
         lastF6 = nowF6;
+        const bool nowF7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (nowF7 && !lastF7) pb::diagnostic::console().toggleTrace();
+        lastF7 = nowF7;
+        const bool nowF8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (nowF8 && !lastF8) pb::diagnostic::console().toggleVisible();
+        lastF8 = nowF8;
+        const bool nowF9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (nowF9 && !lastF9) printStats("MANUAL-STATS");
+        lastF9 = nowF9;
+        const bool nowF10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (nowF10 && !lastF10) {
+            rawInputMode = !rawInputMode;
+            if (rawInputMode) {
+                inputs.reconcile([this](int p, bool down) { emit(p, down); });
+                pb::diagnostic::console().write("SAFE", "F10 -> RAW INPUT ON; prediction/queuing bypassed (release jump before toggling)");
+            } else {
+                inputs.reset();
+                pb::diagnostic::console().write("SAFE", "F10 -> BUFFER ON; prediction/queuing enabled (release jump before toggling)");
+            }
+        }
+        lastF10 = nowF10;
         inputs.tick(tick, [this](int p, bool down) { emit(p, down); });
+        if (tick % 960 == 0) printStats("STATS");
     }
     void onRealDeath() {
         // The scene resets its own button state on death. No stale buffered edge
         // should execute after the next attempt starts.
+        pb::diagnostic::console().write("DEATH", "Real player died; clearing queued inputs");
         inputs.reset();
         wasShipMode = false;
     }
 
     bool intercept(bool down, int lane) {
         auto* level = PlayLayer::get();
-        if (!level || oracle.isActive() || injecting) return false;
+        if (!level || oracle.isActive() || injecting || rawInputMode) return false;
         if (lane == 1 && (!level->m_level || !level->m_level->m_twoPlayerMode)) {
             // Do not swallow ordinary P2 events in non-dual levels. In automatic
             // 1P dual, suppress the game's extra P2 edge only while P1 is pending.
@@ -231,6 +315,11 @@ struct Context {
         }
         auto* p = lane == 0 ? level->m_player1 : level->m_player2;
         if (!p || p->m_isDead) return false;
+        ++inputEdges;
+        if (pb::diagnostic::console().trace())
+            pb::diagnostic::console().writef("INPUT", "tick=%llu P%d %s hold=%d pending=%zu", 
+                static_cast<unsigned long long>(tick), lane + 1, down ? "PRESS" : "RELEASE",
+                inputs.holding(lane) ? 1 : 0, inputs.pending(lane));
         const bool isWave = p->m_isDart;
         const bool isShip = p->m_isShip;
         const bool isRobot = p->m_isRobot;
@@ -261,12 +350,32 @@ struct Context {
             const auto choice = pb::Predictor::choose(options, [&](int candidate, int window) {
                 return oracle.predict(level, lane, mirror, down, oldHold, candidate, window);
             });
+            ++predictions;
+            totalProbes += choice.probes;
+            if (choice.uncertain) ++uncertain;
             delay = choice.delay;
-            if (delay > 0) geode::log::debug("PB5 delayed {} ticks, {} -> {} survived, {} probes",
-                                               delay, choice.baseline, choice.predicted, choice.probes);
+            if (delay > 0) {
+                ++delayed;
+                pb::diagnostic::console().writef("PREDICTED",
+                    "tick=%llu P%d %s %s delay=%d forecast=%d->%d / horizon=%d probes=%d [NOT VERIFIED SAVE]",
+                    static_cast<unsigned long long>(tick), lane + 1,
+                    down ? "PRESS" : "RELEASE", (isWave || mixedWave) ? "WAVE" : "NORMAL",
+                    delay, choice.baseline, choice.predicted, horizon, choice.probes);
+            }
+            if (pb::diagnostic::console().trace() || choice.uncertain) {
+                pb::diagnostic::console().writef(choice.uncertain ? "UNCERTAIN" : "FORECAST",
+                    "tick=%llu P%d delay=%d baseline=%d predicted=%d probes=%d uncertain=%d reason=%s",
+                    static_cast<unsigned long long>(tick), lane + 1, delay,
+                    choice.baseline, choice.predicted, choice.probes,
+                    choice.uncertain ? 1 : 0, oracle.lastUncertainty());
+            }
         }
         inputs.input(lane, down, tick, delay,
                      [this](int who, bool pressed) { emit(who, pressed); });
+        if (pb::diagnostic::console().trace()) {
+            pb::diagnostic::console().writef("QUEUE", "tick=%llu P%d newDelay=%d pending=%zu",
+                static_cast<unsigned long long>(tick), lane + 1, delay, inputs.pending(lane));
+        }
         return true; // Consumed. The queue owns delivery, including delay=0.
     }
 };
@@ -275,7 +384,11 @@ Context g;
 } // namespace
 
 $on_mod(Loaded) {
-    geode::log::info("PredictiveBuffer v5 experimental clean-room adapter loaded");
+    pb::diagnostic::console().init();
+    pb::diagnostic::console().write("BOOT", "PredictiveBuffer V5 diagnostic build v0.3.0 loaded, Win64/GD 2.2081");
+    pb::diagnostic::console().write("BOOT", "F10 = RAW INPUT BYPASS for A/B troubleshooting (release jump first)");
+    pb::diagnostic::console().write("BOOT", "IMPORTANT: forecast is approximate; predicted save is not proof of a real save");
+    geode::log::info("PredictiveBuffer V5 diagnostic build loaded; log: %LOCALAPPDATA%/PredictiveBufferV5/debug.log");
 }
 
 class $modify(PB5Play, PlayLayer) {
@@ -294,7 +407,7 @@ class $modify(PB5Play, PlayLayer) {
         PlayLayer::onQuit();
     }
     void flipGravity(PlayerObject* player, bool flip, bool flipSprites) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("gravity-or-spider-or-ring"); return;}
         PlayLayer::flipGravity(player, flip, flipSprites);
     }
     void playEndAnimationToPos(cocos2d::CCPoint where) {
@@ -320,11 +433,11 @@ class $modify(PB5Player, PlayerObject) {
         PlayerObject::incrementJumps();
     }
     void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("gravity-or-spider-or-ring"); return;}
         PlayerObject::playSpiderDashEffect(from, to);
     }
     void ringJump(RingObject* ring, bool pressed) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("gravity-or-spider-or-ring"); return;}
         PlayerObject::ringJump(ring, pressed);
     }
 };
@@ -336,11 +449,11 @@ class $modify(PB5Layer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, player1);
     }
     bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* effect) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return false;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("effect-activation"); return false;}
         return GJBaseGameLayer::canBeActivatedByPlayer(player, effect);
     }
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("gravity-or-spider-or-ring"); return;}
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects,
@@ -368,7 +481,7 @@ class $modify(PB5Layer, GJBaseGameLayer) {
 
 class $modify(PB5Effects, EffectGameObject) {
     void triggerObject(GJBaseGameLayer* layer, int value, const gd::vector<int>* ids) {
-        if (g.oracle.isActive()) {g.oracle.markUncertain(); return;}
+        if (g.oracle.isActive()) {g.oracle.markUncertain("gravity-or-spider-or-ring"); return;}
         EffectGameObject::triggerObject(layer, value, ids);
     }
 };

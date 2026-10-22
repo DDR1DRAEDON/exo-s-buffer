@@ -1,4 +1,24 @@
-# Predictive Buffer V5 — Rework experimental (v0.2.0)
+# Predictive Buffer V5 — Rework experimental (v0.3.0)
+
+## Diagnosticos nuevos: ventana CMD + registro persistente
+
+En Windows, al cargar el mod se intenta abrir **una consola Win32 real** usando
+`AllocConsole` (igual que el binario de referencia). Los mensajes tambien se guardan en
+`%LOCALAPPDATA%\PredictiveBufferV5\debug.log`, incluso si ocultas la consola.
+El visor `VER_REGISTRO_EN_VIVO.cmd` permite ver el archivo en CMD, segundo a segundo.
+
+**Teclas durante una partida:** F6 cambia el preset; F7 activa/desactiva el registro
+detallado de inputs y entregas; F8 oculta/muestra la consola del mod; F9 imprime
+estadisticas (inputs, entregas, predicciones, retrasos e incertidumbre); **F10 activa el paso directo de inputs sin predictor** para comparar con el juego base (suelta salto antes de alternar).
+
+**Para encontrar el fallo:** abre Geometry Dash, entra a un nivel sencillo y comprueba
+que ves `[BOOT]`, `[LIFECYCLE]` y `[STATS]`. Presiona F7, haz clics y revisa
+`[INPUT]`, `[FORECAST]`, `[QUEUE]` y `[EMIT]`. Si el juego cierra, comparte
+`debug.log` y los logs de Geode. **La ventana CMD no permite que ChatGPT observe
+tu PC remotamente**: debes compartir el archivo de registro.
+
+Si **todavia no compila**, en Windows ejecuta `COMPILAR_Y_VER_ERRORES.cmd`.
+Su salida se guarda en `compilacion.log` para detectar el primer error.
 
 **Estado real:** código fuente y pruebas del núcleo listos; **no hay DLL de Windows ni `.geode` compilado** en este ZIP. No es un parche del DLL original: es una implementación independiente y experimental dirigida a GD 2.2081 (Windows 64 bits) / Geode 5.11.2.
 
@@ -67,5 +87,8 @@ Estas pruebas **no prueban la precisión de predicción dentro de Geometry Dash*
 - `src/geode_adapter.cpp`: adaptador de Geode **sin validar**.
 - `tests/test_engine.cpp`: pruebas portables.
 - `.github/workflows/build-windows.yml`: integración continua y empaquetado Win64.
+- `src/DebugConsole.hpp`: consola Windows y registro de ejecucion.
+- `VER_REGISTRO_EN_VIVO.cmd`: muestra el log en vivo.
+- `COMPILAR_Y_VER_ERRORES.cmd`: compilacion en CMD con salida a archivo.
 - `build-windows.ps1`: compilación local.
 - `docs/GUIA_ES.md`: detalles técnicos de la primera versión del prototipo.

@@ -3,9 +3,9 @@
   "gd": {
     "win": "2.2081"
   },
-  "version": "v0.2.0",
+  "version": "v0.3.0",
   "id": "exo.predictivebuffer.v5",
-  "name": "Predictive Buffer V5 (Experimental)",
+  "name": "Predictive Buffer V5 (Diagnostics)",
   "developer": "Exo",
-  "description": "Experimental bounded predictive buffering, ordered inputs, and separated dual controls for Geometry Dash 2.2081 (Windows)."
+  "description": "Experimental bounded predictive buffering, ordered inputs, native live console, file diagnostics, and dual controls for Geometry Dash 2.2081 (Windows)."
 }
