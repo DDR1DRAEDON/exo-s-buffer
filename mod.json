@@ -1,0 +1,11 @@
+{
+  "geode": "5.11.2",
+  "gd": {
+    "win": "2.2081"
+  },
+  "version": "v0.2.0",
+  "id": "exo.predictivebuffer.v5",
+  "name": "Predictive Buffer V5 (Experimental)",
+  "developer": "Exo",
+  "description": "Experimental bounded predictive buffering, ordered inputs, and separated dual controls for Geometry Dash 2.2081 (Windows)."
+}
